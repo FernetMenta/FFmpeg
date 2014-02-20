@@ -1196,8 +1196,12 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
         st->pts_buffer[0] = pkt->pts;
         for (i = 0; i<delay && st->pts_buffer[i] > st->pts_buffer[i + 1]; i++)
             FFSWAP(int64_t, st->pts_buffer[i], st->pts_buffer[i + 1]);
-        if (pkt->dts == AV_NOPTS_VALUE)
+        if (pkt->dts == AV_NOPTS_VALUE) {
             pkt->dts = st->pts_buffer[0];
+            // don't let calculated timestamps jump back
+            if (pc->last_dts != AV_NOPTS_VALUE && pkt->dts < pc->last_dts)
+            	pkt->dts = pc->last_dts;
+        }
     }
     // We skipped it above so we try here.
     if (st->codec->codec_id == AV_CODEC_ID_H264 ||

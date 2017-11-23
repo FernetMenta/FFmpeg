@@ -316,6 +316,11 @@ segment index to start live streams at (negative values are from the end).
 @item max_reload
 Maximum number of times a insufficient list is attempted to be reloaded.
 Default value is 1000.
+
+@item load_all_variants
+If 0, only the first variant/playlist is loaded on open. All other variants
+get disabled and can be enabled by setting discard option in program.
+Default value is 1.
 @end table
 
 @section image2

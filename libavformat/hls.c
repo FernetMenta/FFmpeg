@@ -112,6 +112,7 @@ struct playlist {
     int n_segments;
     struct segment **segments;
     int needed, cur_needed;
+    int parsed;
     int cur_seq_no;
     int64_t cur_seg_offset;
     int64_t last_load_time;
@@ -206,6 +207,7 @@ typedef struct HLSContext {
     int strict_std_compliance;
     char *allowed_extensions;
     int max_reload;
+    int load_all_variants;
 } HLSContext;
 
 static int read_chomp_line(AVIOContext *s, char *buf, int maxlen)
@@ -315,6 +317,7 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
     pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
 
     pls->index = c->n_playlists;
+    pls->parsed = 0;
     pls->needed = 0;
     dynarray_add(&c->playlists, &c->n_playlists, pls);
     return pls;
@@ -723,6 +726,7 @@ static int parse_playlist(HLSContext *c, const char *url,
         free_segment_list(pls);
         pls->finished = 0;
         pls->type = PLS_TYPE_UNSPECIFIED;
+        pls->parsed = 1;
     }
     while (!avio_feof(in)) {
         read_chomp_line(in, line, sizeof(line));
@@ -1379,23 +1383,41 @@ reload:
 static void add_renditions_to_variant(HLSContext *c, struct variant *var,
                                       enum AVMediaType type, const char *group_id)
 {
-    int i;
+    int i, j;
+    int found;
 
     for (i = 0; i < c->n_renditions; i++) {
         struct rendition *rend = c->renditions[i];
 
         if (rend->type == type && !strcmp(rend->group_id, group_id)) {
 
-            if (rend->playlist)
+            if (rend->playlist) {
                 /* rendition is an external playlist
                  * => add the playlist to the variant */
-                dynarray_add(&var->playlists, &var->n_playlists, rend->playlist);
-            else
+                found = 0;
+                for (j = 0; j < var->n_playlists; j++) {
+                    if (var->playlists[j] == rend->playlist) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found)
+                    dynarray_add(&var->playlists, &var->n_playlists, rend->playlist);
+            } else {
                 /* rendition is part of the variant main Media Playlist
                  * => add the rendition to the main Media Playlist */
-                dynarray_add(&var->playlists[0]->renditions,
-                             &var->playlists[0]->n_renditions,
-                             rend);
+                found = 0;
+                for (j = 0; j < var->playlists[0]->n_renditions; j++) {
+                    if (var->playlists[0]->renditions[j] == rend) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found)
+                    dynarray_add(&var->playlists[0]->renditions,
+                                 &var->playlists[0]->n_renditions,
+                                 rend);
+            }
         }
     }
 }
@@ -1660,6 +1682,9 @@ static int init_playlist(HLSContext *c, struct playlist *pls)
     highest_cur_seq_no = 0;
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
+
+        if (!pls->parsed)
+            continue;
         if (pls->cur_seq_no > highest_cur_seq_no)
             highest_cur_seq_no = pls->cur_seq_no;
     }
@@ -1781,6 +1806,9 @@ static int hls_read_header(AVFormatContext *s)
     if ((ret = parse_playlist(c, s->filename, NULL, s->pb)) < 0)
         goto fail;
 
+    /* first playlist was created, set it to parsed */
+    c->variants[0]->playlists[0]->parsed = 1;
+
     if ((ret = save_avio_options(s)) < 0)
         goto fail;
 
@@ -1793,8 +1821,15 @@ static int hls_read_header(AVFormatContext *s)
         goto fail;
     }
     /* If the playlist only contained playlists (Master Playlist),
-     * parse each individual playlist. */
-    if (c->n_playlists > 1 || c->playlists[0]->n_segments == 0) {
+     * parse all individual playlists.
+     * If option load_all_variants is false, load only first variant */
+    if (!c->load_all_variants && c->n_variants > 1) {
+        for (i = 0; i < c->variants[0]->n_playlists; i++) {
+            struct playlist *pls = c->variants[0]->playlists[i];
+            if ((ret = parse_playlist(c, pls->url, pls, NULL)) < 0)
+                goto fail;
+        }
+    } else if (c->n_playlists > 1 || c->playlists[0]->n_segments == 0) {
         for (i = 0; i < c->n_playlists; i++) {
             struct playlist *pls = c->playlists[i];
             if ((ret = parse_playlist(c, pls->url, pls, NULL)) < 0)
@@ -1838,13 +1873,17 @@ static int hls_read_header(AVFormatContext *s)
         if (!program)
             goto fail;
         av_dict_set_int(&program->metadata, "variant_bitrate", v->bandwidth, 0);
+
+        /* start with the first variant and disable all others */
+        if (i > 0 && !c->load_all_variants)
+            program->discard = AVDISCARD_ALL;
     }
 
     /* Select the starting segments */
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
 
-        if (pls->n_segments == 0)
+        if (pls->n_segments == 0 && !pls->parsed)
             continue;
 
         pls->cur_seq_no = select_cur_seq_no(c, pls);
@@ -1855,9 +1894,11 @@ static int hls_read_header(AVFormatContext *s)
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
 
+        if (!pls->parsed)
+        	continue;
+
         if ((ret = init_playlist(c, pls)) < 0)
 		    goto fail;
-
     }
 
     update_noheader_flag(s);
@@ -1908,6 +1949,36 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
     return changed;
 }
 
+static void recheck_discard_programs(AVFormatContext *s)
+{
+    HLSContext *c = s->priv_data;
+    int i, j;
+
+    for (i = 0; i < c->n_variants; i++) {
+        struct variant *var = c->variants[i];
+        AVProgram *program = s->programs[i];
+
+        if (program->discard >= AVDISCARD_ALL)
+            continue;
+
+        for (j = 0; j < c->variants[i]->n_playlists; j++) {
+            struct playlist *pls = c->variants[i]->playlists[j];
+
+            if (!pls->parsed) {
+                if (parse_playlist(c, pls->url, pls, NULL) < 0)
+                    continue;
+                if (var->audio_group[0])
+                    add_renditions_to_variant(c, var, AVMEDIA_TYPE_AUDIO, var->audio_group);
+                if (var->video_group[0])
+                    add_renditions_to_variant(c, var, AVMEDIA_TYPE_VIDEO, var->video_group);
+                if (var->subtitles_group[0])
+                    add_renditions_to_variant(c, var, AVMEDIA_TYPE_SUBTITLE, var->subtitles_group);
+                init_playlist(c, pls);
+            }
+        }
+    }
+}
+
 static void fill_timing_for_id3_timestamped_stream(struct playlist *pls)
 {
     if (pls->id3_offset >= 0) {
@@ -1954,6 +2025,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     HLSContext *c = s->priv_data;
     int ret, i, minplaylist = -1;
+
+    recheck_discard_programs(s);
 
     recheck_discard_flags(s, c->first_packet);
     c->first_packet = 0;
@@ -2132,6 +2205,8 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     for (i = 0; i < c->n_playlists; i++) {
         /* Reset reading */
         struct playlist *pls = c->playlists[i];
+        if (!pls->parsed)
+            continue;
         if (pls->input)
             ff_format_io_close(pls->parent, &pls->input);
         av_packet_unref(&pls->pkt);
@@ -2188,6 +2263,8 @@ static const AVOption hls_options[] = {
         INT_MIN, INT_MAX, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
         OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 1000}, 0, INT_MAX, FLAGS},
+    {"load_all_variants", "if > 0 all playlists of all variants are opened at startup",
+        OFFSET(load_all_variants), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
     {NULL}
 };
 
